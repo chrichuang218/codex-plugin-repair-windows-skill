@@ -1,0 +1,3 @@
+display_name: Codex Plugin Repair Windows
+short_description: 修复 Windows Codex bundled 插件
+default_prompt: Windows 版 Codex 更新后，帮我修复 Chrome 和 Computer Use 插件。
