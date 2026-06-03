@@ -93,6 +93,7 @@ import json, pathlib, sys, tomllib
 p = pathlib.Path(sys.argv[1])
 cfg = tomllib.loads(p.read_text(encoding="utf-8-sig"))
 print(json.dumps({
+  "browserEnabledInConfig": cfg.get("plugins", {}).get("browser@openai-bundled", {}).get("enabled"),
   "chromeEnabledInConfig": cfg.get("plugins", {}).get("chrome@openai-bundled", {}).get("enabled"),
   "computerUseEnabledInConfig": cfg.get("plugins", {}).get("computer-use@openai-bundled", {}).get("enabled"),
   "featuresComputerUse": cfg.get("features", {}).get("computer_use"),
@@ -182,6 +183,43 @@ if (-not $DiagnoseOnly) {
   New-Item -ItemType Junction -Path $chromeLatest -Target $chromeVersionDir | Out-Null
 }
 
+$browserSource = Join-Path $marketplaceMirror 'plugins\browser'
+if (-not (Test-AnyPath $browserSource)) {
+  $browserSource = Join-Path $packageMarketplace 'plugins\browser'
+}
+$browserVersion = $null
+$browserCacheRoot = Join-Path $pluginCacheRoot 'browser'
+$browserLatest = Join-Path $browserCacheRoot 'latest'
+$browserVersionDir = $null
+if (Test-AnyPath $browserSource) {
+  $browserPluginJson = Join-Path $browserSource '.codex-plugin\plugin.json'
+  if (Test-Leaf $browserPluginJson) {
+    $browserMeta = Get-Content -LiteralPath $browserPluginJson -Raw | ConvertFrom-Json
+    $browserVersion = $browserMeta.version
+    $browserVersionDir = Join-Path $browserCacheRoot $browserVersion
+
+    if (-not $DiagnoseOnly) {
+      Write-Step "refreshing browser cache version $browserVersion"
+      New-Item -ItemType Directory -Force -Path $browserCacheRoot | Out-Null
+      if (-not (Test-Path -LiteralPath $browserVersionDir)) {
+        Copy-Item -LiteralPath $browserSource -Destination $browserVersionDir -Recurse -Force
+      } else {
+        Copy-Item -LiteralPath (Join-Path $browserSource '*') -Destination $browserVersionDir -Recurse -Force
+      }
+
+      if (Test-Path -LiteralPath $browserLatest) {
+        $browserLatestItem = Get-Item -LiteralPath $browserLatest -Force
+        if ($browserLatestItem.LinkType -eq 'Junction' -or $browserLatestItem.LinkType -eq 'SymbolicLink') {
+          Remove-LinkDirectory $browserLatest
+        } else {
+          throw "Refusing to replace non-link browser latest path: $browserLatest"
+        }
+      }
+      New-Item -ItemType Junction -Path $browserLatest -Target $browserVersionDir | Out-Null
+    }
+  }
+}
+
 $computerUseSource = Join-Path $marketplaceMirror 'plugins\computer-use'
 if (-not (Test-AnyPath $computerUseSource)) {
   $computerUseSource = Join-Path $packageMarketplace 'plugins\computer-use'
@@ -264,6 +302,9 @@ if (-not $DiagnoseOnly) {
     source_type = 'local'
     source = "\\?\$marketplaceMirror"
     last_updated = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  }
+  if ($browserVersion) {
+    Update-TomlBlock $configPath '[plugins."browser@openai-bundled"]' @{ enabled = $true }
   }
   Update-TomlBlock $configPath '[plugins."chrome@openai-bundled"]' @{ enabled = $true }
   if ($computerUseVersion) {
@@ -365,6 +406,8 @@ $summary = [ordered]@{
   codexPackageVersion = $pkg.Version.ToString()
   codexPackageSignature = $pkg.SignatureKind.ToString()
   marketplaceManifest = Test-Leaf (Join-Path $marketplaceMirror '.agents\plugins\marketplace.json')
+  browserLatest = Test-AnyPath $browserLatest
+  browserClient = Test-Leaf (Join-Path $browserLatest 'scripts\browser-client.mjs')
   chromeLatest = Test-AnyPath $chromeLatest
   chromeBrowserClient = Test-Leaf $browserClientPath
   chromeExtensionHost = Test-Leaf $extensionHostPath
