@@ -1,5 +1,5 @@
 ---
-name: codex-plugin-repair-windows
+name: codex-plugin-repair-windows-skill
 description: Repair Windows Codex Desktop bundled plugin state after app updates, especially Chrome, Computer Use, openai-bundled marketplace, native host, chrome/latest, and user-profile plugin cache issues. Use when Windows 版 Codex 更新后 Chrome 插件或 Computer Use 插件消失、不可用、未 installed/enabled、native host 异常、openai-bundled 缺失、latest 链接损坏，或 Computer Use runtime 无法启动。User-profile repair only; do not MSIX repatch.
 ---
 
