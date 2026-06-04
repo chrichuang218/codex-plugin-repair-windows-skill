@@ -105,3 +105,11 @@ python "$env:USERPROFILE\.codex\skills\.system\skill-creator\scripts\quick_valid
 ## 关键词
 
 Codex, Codex Desktop, Windows Codex, Codex Skill, Chrome Plugin, Computer Use, openai-bundled, native host, chrome latest, plugin repair, Windows plugin cache.
+
+## 🙏 致谢
+
+感谢 [LINUX DO](https://linux.do/) 社区的支持与讨论。
+
+## 许可证
+
+本项目基于 [MIT License](LICENSE) 开源。
