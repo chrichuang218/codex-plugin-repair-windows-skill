@@ -43,6 +43,125 @@ function Remove-LinkDirectory {
   [System.IO.Directory]::Delete($Path, $false)
 }
 
+function Invoke-CheckedNative {
+  param([scriptblock]$Command)
+  $output = & $Command
+  if ($LASTEXITCODE -ne 0) {
+    throw "native command failed LASTEXITCODE=$LASTEXITCODE"
+  }
+  return $output
+}
+
+function Resolve-CodexResources {
+  param([string]$ConfigPath)
+
+  $candidates = [System.Collections.Generic.List[string]]::new()
+  $tomlText = if (Test-Leaf $ConfigPath) { Get-Content -LiteralPath $ConfigPath -Raw } else { '' }
+
+  foreach ($pattern in @(
+    "CODEX_CLI_PATH\s*=\s*['""]([^'""]*?resources[\\/]+codex\.exe)['""]",
+    "command\s*=\s*['""]([^'""]*?resources[\\/]+cua_node[\\/]+bin[\\/]+node_repl\.exe)['""]",
+    "NODE_REPL_NODE_PATH\s*=\s*['""]([^'""]*?resources[\\/]+cua_node[\\/]+bin[\\/]+node\.exe)['""]"
+  )) {
+    $m = [regex]::Match($tomlText, $pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if ($m.Success) {
+      $path = $m.Groups[1].Value
+      $resourcesIndex = $path.LastIndexOf('\resources\', [System.StringComparison]::OrdinalIgnoreCase)
+      if ($resourcesIndex -ge 0) {
+        $candidates.Add($path.Substring(0, $resourcesIndex + '\resources'.Length))
+      }
+    }
+  }
+
+  try {
+    foreach ($path in (& where.exe codex.exe 2>$null)) {
+      if ($path -match '[\\/]resources[\\/]codex\.exe$') {
+        $candidates.Add((Split-Path -Parent $path))
+      }
+    }
+  } catch {
+    # where.exe is only an additional hint.
+  }
+
+  try {
+    $pkg = Get-AppxPackage -Name OpenAI.Codex -ErrorAction Stop | Select-Object -First 1
+    if ($pkg) {
+      $candidates.Add((Join-Path $pkg.InstallLocation 'app\resources'))
+    }
+  } catch {
+    Write-Step "AppX package discovery unavailable; trying portable/runtime paths"
+  }
+
+  foreach ($candidate in ($candidates | Where-Object { $_ } | Select-Object -Unique)) {
+    $manifest = Join-Path $candidate 'plugins\openai-bundled\.agents\plugins\marketplace.json'
+    if (Test-Leaf $manifest) {
+      return [pscustomobject]@{
+        ResourcesPath = $candidate
+        MarketplacePath = Join-Path $candidate 'plugins\openai-bundled'
+      }
+    }
+  }
+
+  throw 'Codex bundled resources not found. Checked config paths, PATH codex.exe, and AppX package hints.'
+}
+
+function Sync-DirectoryIncremental {
+  param(
+    [string]$Source,
+    [string]$Destination
+  )
+  New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+  & robocopy $Source $Destination /E /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Host
+  if ($LASTEXITCODE -ge 8) {
+    throw "robocopy failed LASTEXITCODE=$LASTEXITCODE source=$Source destination=$Destination"
+  }
+}
+
+function Repair-EncodedNodeModulePaths {
+  param([string]$NodeModules)
+
+  if (-not (Test-Path -LiteralPath $NodeModules -PathType Container)) {
+    return 0
+  }
+
+  $created = 0
+  Get-ChildItem -LiteralPath $NodeModules -Recurse -Directory -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like '*%40*' } |
+    ForEach-Object {
+      $decodedName = $_.Name -replace '%40', '@'
+      if ($decodedName -eq $_.Name) {
+        return
+      }
+      $link = Join-Path $_.Parent.FullName $decodedName
+      if (Test-Path -LiteralPath $link) {
+        $item = Get-Item -LiteralPath $link -Force
+        if ($item.LinkType -eq 'Junction' -or $item.LinkType -eq 'SymbolicLink') {
+          return
+        }
+        throw "Refusing to replace existing non-link path: $link"
+      }
+      New-Item -ItemType Junction -Path $link -Target $_.FullName | Out-Null
+      $created += 1
+    }
+
+  Get-ChildItem -LiteralPath $NodeModules -Recurse -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like '*%24*' } |
+    ForEach-Object {
+      $decodedName = $_.Name -replace '%24', '$'
+      if ($decodedName -eq $_.Name) {
+        return
+      }
+      $link = Join-Path $_.DirectoryName $decodedName
+      if (Test-Path -LiteralPath $link) {
+        return
+      }
+      New-Item -ItemType HardLink -Path $link -Target $_.FullName | Out-Null
+      $created += 1
+    }
+
+  return $created
+}
+
 function Update-TomlBlock {
   param(
     [string]$ConfigPath,
@@ -122,15 +241,12 @@ $chromeHostsStatePath = Join-Path $codexHome 'chrome-native-hosts.json'
 $marketplaceMirror = Join-Path $codexHome '.tmp\bundled-marketplaces\openai-bundled'
 $pluginCacheRoot = Join-Path $codexHome 'plugins\cache\openai-bundled'
 
-$pkg = Get-AppxPackage -Name OpenAI.Codex | Select-Object -First 1
-if (-not $pkg) {
-  throw 'OpenAI.Codex AppX package not found.'
-}
-
-$packageMarketplace = Join-Path $pkg.InstallLocation 'app\resources\plugins\openai-bundled'
+$codexResources = Resolve-CodexResources $configPath
+$packageMarketplace = $codexResources.MarketplacePath
+$resourcesPath = $codexResources.ResourcesPath
 $packageManifest = Join-Path $packageMarketplace '.agents\plugins\marketplace.json'
 if (-not (Test-Leaf $packageManifest)) {
-  throw "Bundled marketplace manifest not found in current Codex package: $packageManifest"
+  throw "Bundled marketplace manifest not found in current Codex resources: $packageManifest"
 }
 
 New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
@@ -141,18 +257,12 @@ Copy-IfExists $marketplaceMirror (Join-Path $backupDir 'openai-bundled-marketpla
 Write-Step "backup: $backupDir"
 
 if (-not $DiagnoseOnly) {
-  Write-Step "syncing bundled marketplace from current Codex package"
+  Write-Step "syncing bundled marketplace mirror from current Codex resources"
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $marketplaceMirror) | Out-Null
-  if (Test-Path -LiteralPath $marketplaceMirror) {
-    Remove-Item -LiteralPath $marketplaceMirror -Recurse -Force
-  }
-  Copy-Item -LiteralPath $packageMarketplace -Destination $marketplaceMirror -Recurse -Force
+  Sync-DirectoryIncremental $packageMarketplace $marketplaceMirror
 }
 
-$chromeSource = Join-Path $marketplaceMirror 'plugins\chrome'
-if (-not (Test-AnyPath $chromeSource)) {
-  $chromeSource = Join-Path $packageMarketplace 'plugins\chrome'
-}
+$chromeSource = Join-Path $packageMarketplace 'plugins\chrome'
 $chromePluginJson = Join-Path $chromeSource '.codex-plugin\plugin.json'
 if (-not (Test-Leaf $chromePluginJson)) {
   throw "Chrome plugin metadata not found: $chromePluginJson"
@@ -166,11 +276,7 @@ $chromeLatest = Join-Path $chromeCacheRoot 'latest'
 if (-not $DiagnoseOnly) {
   Write-Step "refreshing chrome cache version $chromeVersion"
   New-Item -ItemType Directory -Force -Path $chromeCacheRoot | Out-Null
-  if (-not (Test-Path -LiteralPath $chromeVersionDir)) {
-    Copy-Item -LiteralPath $chromeSource -Destination $chromeVersionDir -Recurse -Force
-  } else {
-    Copy-Item -LiteralPath (Join-Path $chromeSource '*') -Destination $chromeVersionDir -Recurse -Force
-  }
+  Sync-DirectoryIncremental $chromeSource $chromeVersionDir
 
     if (Test-Path -LiteralPath $chromeLatest) {
       $latestItem = Get-Item -LiteralPath $chromeLatest -Force
@@ -183,10 +289,7 @@ if (-not $DiagnoseOnly) {
   New-Item -ItemType Junction -Path $chromeLatest -Target $chromeVersionDir | Out-Null
 }
 
-$browserSource = Join-Path $marketplaceMirror 'plugins\browser'
-if (-not (Test-AnyPath $browserSource)) {
-  $browserSource = Join-Path $packageMarketplace 'plugins\browser'
-}
+$browserSource = Join-Path $packageMarketplace 'plugins\browser'
 $browserVersion = $null
 $browserCacheRoot = Join-Path $pluginCacheRoot 'browser'
 $browserLatest = Join-Path $browserCacheRoot 'latest'
@@ -201,11 +304,7 @@ if (Test-AnyPath $browserSource) {
     if (-not $DiagnoseOnly) {
       Write-Step "refreshing browser cache version $browserVersion"
       New-Item -ItemType Directory -Force -Path $browserCacheRoot | Out-Null
-      if (-not (Test-Path -LiteralPath $browserVersionDir)) {
-        Copy-Item -LiteralPath $browserSource -Destination $browserVersionDir -Recurse -Force
-      } else {
-        Copy-Item -LiteralPath (Join-Path $browserSource '*') -Destination $browserVersionDir -Recurse -Force
-      }
+      Sync-DirectoryIncremental $browserSource $browserVersionDir
 
       if (Test-Path -LiteralPath $browserLatest) {
         $browserLatestItem = Get-Item -LiteralPath $browserLatest -Force
@@ -220,10 +319,7 @@ if (Test-AnyPath $browserSource) {
   }
 }
 
-$computerUseSource = Join-Path $marketplaceMirror 'plugins\computer-use'
-if (-not (Test-AnyPath $computerUseSource)) {
-  $computerUseSource = Join-Path $packageMarketplace 'plugins\computer-use'
-}
+$computerUseSource = Join-Path $packageMarketplace 'plugins\computer-use'
 $computerUseVersion = $null
 $computerUseCacheRoot = Join-Path $pluginCacheRoot 'computer-use'
 $computerUseLatest = Join-Path $computerUseCacheRoot 'latest'
@@ -238,11 +334,7 @@ if (Test-AnyPath $computerUseSource) {
     if (-not $DiagnoseOnly) {
       Write-Step "refreshing computer-use cache version $computerUseVersion"
       New-Item -ItemType Directory -Force -Path $computerUseCacheRoot | Out-Null
-      if (-not (Test-Path -LiteralPath $computerUseVersionDir)) {
-        Copy-Item -LiteralPath $computerUseSource -Destination $computerUseVersionDir -Recurse -Force
-      } else {
-        Copy-Item -LiteralPath (Join-Path $computerUseSource '*') -Destination $computerUseVersionDir -Recurse -Force
-      }
+      Sync-DirectoryIncremental $computerUseSource $computerUseVersionDir
 
       if (Test-Path -LiteralPath $computerUseLatest) {
         $cuLatestItem = Get-Item -LiteralPath $computerUseLatest -Force
@@ -283,12 +375,35 @@ if (-not $nodeReplPath) {
   $nodeReplPath = (Get-ChildItem -LiteralPath (Join-Path $env:LOCALAPPDATA 'OpenAI\Codex\bin') -Recurse -Filter node_repl.exe -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
 }
 if (-not $codexCliPath) {
-  $codexCliPath = (Get-ChildItem -LiteralPath (Join-Path $env:LOCALAPPDATA 'OpenAI\Codex\bin') -Recurse -Filter codex.exe -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+  $codexCliPath = Join-Path $resourcesPath 'codex.exe'
 }
 
 if (-not (Test-Leaf $nodePath)) { throw "node.exe not found: $nodePath" }
 if (-not (Test-Leaf $nodeReplPath)) { throw "node_repl.exe not found: $nodeReplPath" }
 if (-not (Test-Leaf $codexCliPath)) { throw "codex.exe not found: $codexCliPath" }
+
+$nodeModulesPath = Split-Path -Parent $nodePath
+$nodeModulesPath = Join-Path $nodeModulesPath 'node_modules'
+$encodedNodeModuleFixes = 0
+$cuaNodeSetupOk = $null
+if (-not $DiagnoseOnly) {
+  Write-Step "repairing encoded Node module paths"
+  $encodedNodeModuleFixes = Repair-EncodedNodeModulePaths $nodeModulesPath
+  $setupScript = Join-Path $resourcesPath 'cua_node\bin\setup.ps1'
+  if (Test-Leaf $setupScript) {
+    Write-Step "validating cua_node runtime"
+    try {
+      powershell -NoProfile -ExecutionPolicy Bypass -File $setupScript | Write-Host
+      $cuaNodeSetupOk = ($LASTEXITCODE -eq 0)
+      if (-not $cuaNodeSetupOk) {
+        throw "cua_node setup failed LASTEXITCODE=$LASTEXITCODE"
+      }
+    } catch {
+      $cuaNodeSetupOk = $false
+      throw
+    }
+  }
+}
 
 if (-not $DiagnoseOnly) {
   Write-Step "updating config.toml plugin and marketplace entries"
@@ -300,7 +415,7 @@ if (-not $DiagnoseOnly) {
 
   Update-TomlBlock $configPath '[marketplaces.openai-bundled]' @{
     source_type = 'local'
-    source = "\\?\$marketplaceMirror"
+    source = "\\?\$packageMarketplace"
     last_updated = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
   }
   if ($browserVersion) {
@@ -309,6 +424,19 @@ if (-not $DiagnoseOnly) {
   Update-TomlBlock $configPath '[plugins."chrome@openai-bundled"]' @{ enabled = $true }
   if ($computerUseVersion) {
     Update-TomlBlock $configPath '[plugins."computer-use@openai-bundled"]' @{ enabled = $true }
+  }
+
+  $computerUseRuntimeExe = Join-Path $nodeModulesPath '@oai\sky\bin\windows\codex-computer-use.exe'
+  if (Test-Leaf $computerUseRuntimeExe) {
+    $text = Get-Content -LiteralPath $configPath -Raw
+    $notifyPattern = '(?m)^notify\s*=\s*\[.*?codex-computer-use\.exe"\s*,\s*"turn-ended"\s*\]'
+    $notifyReplacement = 'notify = [ "' + $computerUseRuntimeExe.Replace('\', '\\') + '", "turn-ended" ]'
+    if ($text -match $notifyPattern) {
+      $text = [regex]::Replace($text, $notifyPattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $notifyReplacement }, 1)
+    } elseif ($text -notmatch '(?m)^notify\s*=') {
+      $text = $notifyReplacement + [Environment]::NewLine + $text
+    }
+    Set-Content -LiteralPath $configPath -Value $text -Encoding UTF8
   }
 }
 
@@ -349,7 +477,7 @@ console.log('INSTALL_MANIFEST_OK');
     pluginVersion = $chromeVersion
     proxyHost = '127.0.0.1'
     proxyPort = 0
-    resourcesPath = (Join-Path $pkg.InstallLocation 'app\resources')
+    resourcesPath = $resourcesPath
     updatedAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
   }
   ([ordered]@{ schemaVersion = 1; chromeNativeHosts = @($entry) } | ConvertTo-Json -Depth 8) |
@@ -397,15 +525,18 @@ foreach ($root in @($computerUseLatest, $computerUseVersionDir)) {
   }
 }
 $computerUseHelperOk = [bool]$computerUseHelper
+$computerUseClient = Test-Leaf (Join-Path $computerUseLatest 'scripts\computer-use-client.mjs')
+$computerUseRuntimeExeOk = Test-Leaf (Join-Path $nodeModulesPath '@oai\sky\bin\windows\codex-computer-use.exe')
 
 $tomlSummary = Get-TomlSummary $configPath
 
 $summary = [ordered]@{
   diagnoseOnly = [bool]$DiagnoseOnly
   backupDir = $backupDir
-  codexPackageVersion = $pkg.Version.ToString()
-  codexPackageSignature = $pkg.SignatureKind.ToString()
-  marketplaceManifest = Test-Leaf (Join-Path $marketplaceMirror '.agents\plugins\marketplace.json')
+  resourcesPath = $resourcesPath
+  bundledMarketplace = $packageMarketplace
+  marketplaceManifest = Test-Leaf (Join-Path $packageMarketplace '.agents\plugins\marketplace.json')
+  marketplaceMirrorManifest = Test-Leaf (Join-Path $marketplaceMirror '.agents\plugins\marketplace.json')
   browserLatest = Test-AnyPath $browserLatest
   browserClient = Test-Leaf (Join-Path $browserLatest 'scripts\browser-client.mjs')
   chromeLatest = Test-AnyPath $chromeLatest
@@ -418,6 +549,10 @@ $summary = [ordered]@{
   computerUseLatestTargetExists = $computerUseLatestTargetExists
   computerUseHelper = $computerUseHelperOk
   computerUseHelperPath = $computerUseHelper
+  computerUseClient = $computerUseClient
+  computerUseRuntimeExe = $computerUseRuntimeExeOk
+  encodedNodeModuleFixes = $encodedNodeModuleFixes
+  cuaNodeSetupOk = $cuaNodeSetupOk
   toml = $tomlSummary
 }
 
